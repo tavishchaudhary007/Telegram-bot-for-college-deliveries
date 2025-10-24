@@ -1,0 +1,2126 @@
+"""
+E-commerce Telegram Bot - Clean OOP Architecture
+Handles multi-shop delivery system with proper order management
+"""
+
+import random
+import os
+from datetime import datetime, time
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
+import PyPDF2
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, filters,
+    ContextTypes, ConversationHandler, CallbackQueryHandler
+)
+import pymongo
+import pandas as pd
+import io
+import smtplib
+from email.message import EmailMessage
+# main() function or a config file
+from pymongo import MongoClient
+import certifi # May be needed for Atlas connections
+from pymongo.collection import Collection
+from dataclasses import dataclass, field, asdict # To convert dataclasses to dicts for Mongo
+
+# Replace with your MongoDB connection string
+MONGO_URI = "your uri"
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where()) # Use tlsCAFile for Atlas
+db = client.get_database() # Gets the database specified in the URI
+
+# Get references to your collections
+users_collection = db["users"]
+orders_collection = db["orders"]
+complaints_collection = db["complaints"]
+sales_collection = db["shop_sales"] # New collection for sales tracking
+
+# ==================== ENUMS ====================
+class DeliveryType(Enum):
+    INSTANT = "Instant"
+    BULK = "Bulk"
+
+
+class OrderStatus(Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    DELIVERED = "delivered"
+    CANCELLED = "cancelled"
+    NOT_ARRIVED = "not_arrived"
+
+
+class Category(Enum):
+    STATIONERY = "stationery"
+    GROCERY = "grocery"
+    MEDICAL = "medical"
+    PRINTOUT = "printout"
+
+
+class PrintoutColor(Enum):
+    COLOR = "p_color"
+    BW = "p_bw"
+
+
+class PrintoutSides(Enum):
+    SINGLE = "p_single"
+    DOUBLE = "p_double"
+
+
+# ==================== DATA CLASSES ====================
+@dataclass
+class Shopkeeper:
+    """Represents a shopkeeper in the system"""
+    id: int
+    phone: str
+
+
+@dataclass
+class CatalogItem:
+    """Represents an item in the catalog"""
+    name: str
+    price: int
+
+
+@dataclass
+class PrintoutDetails:
+    """Details for a printout order"""
+    color: PrintoutColor
+    sides: PrintoutSides
+    file_id: str
+    file_name: str
+    pages: int
+
+
+@dataclass
+class Order:
+    """Represents a customer order"""
+    order_id: str
+    user_id: int
+    category: Category
+    delivery_type: DeliveryType
+    items: Dict[str, int] = field(default_factory=dict)
+    delivery_time: Optional[str] = None
+    printout_details: Optional[PrintoutDetails] = None
+    total_cost: int = 0
+    status: OrderStatus = OrderStatus.PENDING
+    is_accepted: bool = False  # Flag to track if any shopkeeper accepted
+    approved_by: Optional[str] = None
+    shopkeeper_msg_ids: Dict[str, int] = field(default_factory=dict)
+    rejections: Set[str] = field(default_factory=set)
+    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self):
+        """Converts Order to a DB-safe dictionary."""
+        # Use asdict, but then fix Enums
+        data = asdict(self)
+        data['category'] = self.category.value
+        data['delivery_type'] = self.delivery_type.value
+        data['status'] = self.status.value
+        
+        if self.printout_details:
+            data['printout_details']['color'] = self.printout_details.color.value
+            data['printout_details']['sides'] = self.printout_details.sides.value
+        
+        # Ensure order_id is the primary key _id
+        data['_id'] = data.pop('order_id') 
+        return data
+
+    @staticmethod
+    def from_dict(data: dict):
+        """Converts DB dict back to Order object."""
+        data['category'] = Category(data['category'])
+        data['delivery_type'] = DeliveryType(data['delivery_type'])
+        data['status'] = OrderStatus(data['status'])
+        
+        if data.get('printout_details'):
+            data['printout_details']['color'] = PrintoutColor(data['printout_details']['color'])
+            data['printout_details']['sides'] = PrintoutSides(data['printout_details']['sides'])
+            data['printout_details'] = PrintoutDetails(**data['printout_details'])
+        
+        data['order_id'] = data.pop('_id')
+        
+        # Handle fields that might not be in old DB records
+        # (Example: 'rejections' might be new)
+        fields = {f.name for f in Order.__dataclass_fields__}
+        cleaned_data = {k: v for k, v in data.items() if k in fields}
+        
+        return Order(**cleaned_data)
+
+
+@dataclass
+class UserProfile:
+    """Represents a user profile"""
+    user_id: int
+    email: str
+    name: str
+    phone: str
+    strikes: int = 0
+    otp: Optional[str] = None
+    login_otp: Optional[str] = None
+    current_order: Optional[Order] = None
+    last_order: Optional[Order] = None
+    def to_dict(self) -> dict:
+        """Converts UserProfile to a DB-safe dictionary."""
+        
+        # Use asdict to get a dict, but exclude runtime objects
+        data = asdict(self, dict_factory=lambda x: {
+            k: v for (k, v) in x 
+            if k not in ['current_order', 'last_order'] # Exclude these
+        })
+        
+        # Map user_id to MongoDB's _id
+        data['_id'] = data.pop('user_id')
+        return data
+
+    # --- ADD THIS STATIC METHOD ---
+    @staticmethod
+    def from_dict(data: dict):
+        """Converts DB dict back to UserProfile object."""
+        
+        # Map _id back to user_id
+        if '_id' in data:
+            data['user_id'] = data.pop('_id')
+        
+        # Get all field names defined in the dataclass
+        defined_fields = {f.name for f in UserProfile.__dataclass_fields__.values()} # <-- Add .values() here
+        
+        # Filter the loaded data to only include keys that
+        # are actual fields in our dataclass.
+        # This prevents errors if old DB records have extra fields.
+        cleaned_data = {k: v for k, v in data.items() if k in defined_fields}
+        
+        # Create the UserProfile object
+        # Fields not in the DB (like current_order, last_order)
+        # will automatically be set to their default (None).
+        return UserProfile(**cleaned_data)
+
+
+
+# ==================== CONFIGURATION ====================
+class BotConfig:
+    """Central configuration for the bot"""
+    
+    # Catalogs
+    CATALOGS = {
+        Category.STATIONERY: {
+            "S1": CatalogItem("Notebook", 10),
+            "S2": CatalogItem("Pen", 5),
+            "S3": CatalogItem("Pencil", 3),
+            "S4": CatalogItem("Eraser", 2),
+            "S5": CatalogItem("Marker", 15)
+        },
+        Category.GROCERY: {
+            "G1": CatalogItem("Milk (1L)", 60),
+            "G2": CatalogItem("Bread", 40),
+            "G3": CatalogItem("Eggs (6 pack)", 70)
+        },
+        Category.MEDICAL: {
+            "M1": CatalogItem("Band-Aid (10 pack)", 25),
+            "M2": CatalogItem("Antiseptic Wipes", 80),
+            "M3": CatalogItem("Paracetamol", 30)
+        }
+    }
+    
+    # Shopkeepers
+    SHOPKEEPERS = {
+        Category.STATIONERY: [
+            Shopkeeper(telegram id, '8072678080'),
+            Shopkeeper(telegram id, '9500602639')
+        ],
+        Category.GROCERY: [Shopkeeper(telegram id, '9042394423')],
+        Category.MEDICAL: [Shopkeeper(telegram id, '9626902087')],
+        Category.PRINTOUT: [Shopkeeper(telegram id, '8300646606')]
+    }
+    
+    """Central configuration for the bot"""
+    
+    # ... (Keep existing catalogs, shopkeepers, etc.)
+
+    # --- ADD THESE LINES ---
+    # Email Configuration for OTP
+    SENDER_EMAIL = "email id"  # Your Gmail address
+    SENDER_APP_PASSWORD = "password" # Your 16-character App Password
+    # --- END OF ADDITION ---
+    
+    # ... (Keep existing pricing, IDs, token) 
+
+
+    # Pricing
+    PRICE_BW_PER_PAGE = 10
+    PRICE_COLOR_PER_PAGE = 15
+    DELIVERY_FEE_BULK = 7
+    DELIVERY_FEE_INSTANT = 12
+    PENALTY_FEE = 50
+    MIN_ORDER_BULK = 40
+    MIN_ORDER_INSTANT = 30
+    
+    # IDs
+    COMPLAINT_CHANNEL_ID = telegram id
+    FEEDBACK_CHANNEL_ID = telegram id
+    ORDER_LOG_CHANNEL_ID = telegram id
+    ADMIN_IDS = [telegram id]
+    
+    # Bot Token
+    TOKEN = "your token id"
+
+
+# ==================== CONVERSATION STATES ====================
+class States:
+    """Conversation states"""
+    (EMAIL, OTP, NAME, PHONE, DELIVERY_TYPE, BULK_TIME, CATEGORY, ORDER, CONFIRM,
+  PRINTOUT_COLOR, PRINTOUT_SIDES, PRINTOUT_UPLOAD, DUPLICATE_EMAIL, LOGIN_OTP,
+  FEEDBACK_TEXT, COMPLAINT_TEXT, EMAIL_CONFIRM, PHONE_CONFIRM) = range(18)
+
+
+# ==================== DATA STORE ====================
+class DataStore:
+    """Manages user profiles and orders"""
+    
+    def __init__(self, db):
+        self.db = db  # <-- MongoDB database object
+        self.users: Dict[int, UserProfile] = {} # Keep this as an in-memory cache for active users
+        self.is_raining: bool = False
+        # self.orders is no longer needed. It's in the DB.
+    
+    def get_user(self, user_id: int) -> Optional[UserProfile]:
+        """Get user profile by ID (from cache or DB)"""
+        
+        # 1. Check in-memory cache first
+        if user_id in self.users:
+            return self.users.get(user_id)
+        
+        # 2. Not in cache? Find in DB
+        user_data = self.db.users.find_one({"_id": user_id})
+        
+        if user_data:
+            # 3. Load from DB, convert to object, add to cache, and return
+            # (Assuming you created UserProfile.from_dict)
+            user_profile = UserProfile.from_dict(user_data) 
+            self.users[user_id] = user_profile
+            return user_profile
+            
+        return None # User not found anywhere
+    
+    def create_user(self, user_id: int, email: str, otp: str) -> UserProfile:
+        """Create or update user profile (upsert)"""
+        user = UserProfile(user_id=user_id, email=email, name="", phone="", otp=otp)
+        
+        # Prepare the data to be set or updated
+        user_data_to_set = {
+            "email": email,
+            "otp": otp,
+            # Add any other fields you want to update if the user exists
+            # but is re-registering or providing email again
+            "name": "",  # Reset name/phone if needed during re-auth?
+            "phone": ""  
+        }
+        
+        # Use update_one with upsert=True
+        self.db.users.update_one(
+            {"_id": user_id}, # Filter: find the document by user_id (_id)
+            {
+                "$set": user_data_to_set, # Fields to update if found OR insert if new
+                "$setOnInsert": { # Fields to set ONLY when inserting (new user)
+                     "strikes": 0, 
+                     # Add 'created_at' if you track it
+                     # "created_at": datetime.now() 
+                     } 
+            },
+            upsert=True # This is the key: insert if not found, update if found
+        )
+        
+        # Add to the in-memory cache as well
+        # Note: Fetching after upsert might be safer to get the full profile
+        # For simplicity now, we just update the cache with the known info
+        cached_user = self.users.get(user_id)
+        if cached_user: # Update cache if user was already there
+             cached_user.email = email
+             cached_user.otp = otp
+             # Update other fields in cache if necessary
+        else: # Add to cache if truly new
+             self.users[user_id] = user
+             
+        return user # Return the UserProfile object
+    
+    def update_user(self, user: UserProfile):
+        """Helper to save user updates to DB"""
+        # Call this whenever user details change (e.g., phone, name, strikes)
+        user_dict = user.to_dict()
+        self.db.users.update_one(
+            {"_id": user.user_id},
+            {"$set": user_dict}
+        )
+
+    def get_user_by_email(self, email: str) -> Optional[UserProfile]:
+        """Find user by email (from DB)"""
+        user_data = self.db.users.find_one({"email": email})
+        if user_data:
+            # Load into cache if not already there
+            return self.get_user(user_data['_id'])
+        return None
+    
+    def get_user_by_phone(self, phone: str) -> Optional[UserProfile]:
+        """Find user by phone (from DB)"""
+        user_data = self.db.users.find_one({"phone": phone})
+        if user_data:
+            return self.get_user(user_data['user_id'])
+        return None
+    
+    def create_order(self, user_id: int, category: Category, delivery_type: DeliveryType) -> Order:
+        """Create new order (in memory only for now)"""
+        # This part remains the same! The order isn't "final" yet.
+        order_id = f"ORD_{user_id}_{int(datetime.now().timestamp())}"
+        order = Order(
+            order_id=order_id,
+            user_id=user_id,
+            category=category,
+            delivery_type=delivery_type
+        )
+        # We don't save to db.orders yet.
+        user = self.get_user(user_id)
+        if user:
+            user.current_order = order
+        return order
+    
+    def finalize_order(self, order_id: str):
+        """Move order from current to last AND save to DB"""
+        user_id = int(order_id.split('_')[1]) # Get user_id from order_id
+        user = self.get_user(user_id)
+        
+        if user and user.current_order and user.current_order.order_id == order_id:
+            order = user.current_order
+            
+            # Save the final order state to the database
+            self.db.orders.insert_one(order.to_dict()) 
+            
+            user.last_order = order
+            user.current_order = None
+            
+        elif user and user.last_order and user.last_order.order_id == order_id:
+            # Order is already finalized, just update its status in DB
+            self.db.orders.update_one(
+                {"_id": order_id},
+                {"$set": user.last_order.to_dict()}
+            )
+            
+    def get_order(self, order_id: str) -> Optional[Order]:
+        """Get order by ID (from DB)"""
+        order_data = self.db.orders.find_one({"_id": order_id})
+        if order_data:
+            return Order.from_dict(order_data)
+        return None
+
+
+# ==================== UTILITY CLASSES ====================
+class TimeValidator:
+    """Validates delivery time slots"""
+    
+    @staticmethod
+    def get_bulk_delivery_options() -> tuple:
+        """Get available bulk delivery slots"""
+        now = datetime.now().time()
+        today_str, tomorrow_str = "Today", "Tomorrow"
+        
+        day1 = today_str if now < time(13, 10) else tomorrow_str
+        day2 = today_str if now < time(18, 10) else tomorrow_str
+        day3 = today_str if now < time(21, 10) else tomorrow_str
+        
+        keyboard = [
+            [InlineKeyboardButton(f"{day1} 1:30 PM", callback_data=f"bulk_{day1.lower()}_1330")],
+            [InlineKeyboardButton(f"{day2} 6:30 PM", callback_data=f"bulk_{day2.lower()}_1830")],
+            [InlineKeyboardButton(f"{day3} 9:30 PM", callback_data=f"bulk_{day3.lower()}_2130")]
+        ]
+        return keyboard, "Please choose a bulk delivery time slot:"
+    
+    @staticmethod
+    def is_valid_delivery_time(delivery_type: DeliveryType, delivery_time_str: str = "") -> bool:
+        """Check if delivery time is still valid"""
+        now = datetime.now().time()
+        
+        if delivery_type == DeliveryType.BULK:
+            if 'Today 1:30 PM' in delivery_time_str and now >= time(13, 10):
+                return False
+            elif 'Today 6:30 PM' in delivery_time_str and now >= time(18, 10):
+                return False
+            elif 'Today 9:30 PM' in delivery_time_str and now >= time(21, 10):
+                return False
+        elif delivery_type == DeliveryType.INSTANT and now >= time(21, 13):
+            return False
+        
+        return True
+
+
+class MessageFormatter:
+    class MessageFormatter:
+     """Formats messages for display"""
+    
+    # ... (Keep existing format_catalog, format_cart, format_receipt methods)
+
+    # --- ADD THIS NEW METHOD ---
+    @staticmethod
+    def send_otp_email(recipient_email, otp_code):
+        """Creates and sends the OTP email using Gmail SMTP."""
+        msg = EmailMessage()
+        msg['Subject'] = f"Your OTP Code is {otp_code}"
+        msg['From'] = BotConfig.SENDER_EMAIL
+        msg['To'] = recipient_email
+        msg.set_content(
+            f"Hello,\n\n"
+            f"Your one-time password (OTP) for the bot is: {otp_code}\n\n"
+            f"This code is valid for a few minutes. Please do not share it.\n\n"
+            f"Regards,\nYour Bot Team"
+        )
+        msg.add_alternative(f"""\
+        <html><body>
+            <p>Hello,</p>
+            <p>Your one-time password (OTP) for the bot is:</p>
+            <h1 style="font-size: 2em; letter-spacing: 4px; margin: 20px 0;">{otp_code}</h1>
+            <p>This code is valid for a few minutes. Please do not share it.</p>
+            <p>Regards,<br>Your Bot Team</p>
+        </body></html>
+        """, subtype='html')
+
+        try:
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+                smtp.login(BotConfig.SENDER_EMAIL, BotConfig.SENDER_APP_PASSWORD)
+                smtp.send_message(msg)
+            print(f"OTP email sent successfully to {recipient_email}")
+            return True
+        except Exception as e:
+            print(f"Error sending email: {e}")
+            return False
+    # --- END OF ADDITION ---
+    """Formats messages for display"""
+    
+    @staticmethod
+    def format_catalog(category: Category) -> str:
+        """Format catalog for display"""
+        catalog = BotConfig.CATALOGS.get(category, {})
+        header = f"*Catalog for {category.value.title()}:*\n\n"
+        items = [f"{code}: {item.name} - ₹{item.price}" for code, item in catalog.items()]
+        footer = "\n\nEnter item code and quantity (e.g., `S1 2`). Type `done` when finished."
+        return header + "\n".join(items) + footer
+    
+    @staticmethod
+    def format_cart(order: Order) -> str:
+        """Format cart items for display"""
+        if not order.items:
+            return ""
+        
+        catalog = BotConfig.CATALOGS.get(order.category, {})
+        lines = ["*Your current cart:*"]
+        for code, quantity in order.items.items():
+            lines.append(f"- {catalog[code].name} x{quantity}")
+        return "\n".join(lines)
+    
+    @staticmethod
+    def format_receipt(order: Order, user: UserProfile) -> str:
+        """Format order receipt"""
+        if order.category == Category.PRINTOUT:
+            return MessageFormatter._format_printout_receipt(order, user)
+        else:
+            return MessageFormatter._format_regular_receipt(order, user)
+    
+    @staticmethod
+    def _format_regular_receipt(order: Order, user: UserProfile) -> str:
+        """Format receipt for regular orders"""
+        catalog = BotConfig.CATALOGS[order.category]
+        receipt_lines = [
+            f"{catalog[code].name} x{quantity} - ₹{catalog[code].price * quantity}"
+            for code, quantity in order.items.items()
+        ]
+        
+        if order.delivery_type == DeliveryType.BULK:
+            receipt_lines.append(f"\nDelivery (bulk - {order.delivery_time}): ₹{BotConfig.DELIVERY_FEE_BULK}")
+        else:
+            receipt_lines.append(f"\nDelivery (instant): ₹{BotConfig.DELIVERY_FEE_INSTANT}")
+        
+        if user.strikes >= 2:
+            receipt_lines.append(f"\nPrevious No-Show Penalty: ₹{BotConfig.PENALTY_FEE}")
+        
+        receipt_lines.append(f"\n*Total: ₹{order.total_cost}*")
+        return "*Your Receipt:*\n\n" + "\n".join(receipt_lines)
+    
+    @staticmethod
+    def _format_printout_receipt(order: Order, user: UserProfile) -> str:
+        """Format receipt for printout orders"""
+        details = order.printout_details
+        price_per_page = (BotConfig.PRICE_COLOR_PER_PAGE 
+                         if details.color == PrintoutColor.COLOR 
+                         else BotConfig.PRICE_BW_PER_PAGE)
+        
+        print_cost = details.pages * price_per_page
+        delivery_fee = (BotConfig.DELIVERY_FEE_INSTANT 
+                       if order.delivery_type == DeliveryType.INSTANT 
+                       else BotConfig.DELIVERY_FEE_BULK)
+        
+        color_str = "Color" if details.color == PrintoutColor.COLOR else "Black & White"
+        sides_str = "Single Sided" if details.sides == PrintoutSides.SINGLE else "Front and Back"
+        
+        receipt_lines = [
+            f"📄 File: `{details.file_name}`",
+            f"🔢 Pages: {details.pages}",
+            f"🎨 Type: {color_str}, {sides_str}",
+            f"\nPrint Cost ({details.pages} pages x ₹{price_per_page}/page): ₹{print_cost}",
+            f"Delivery ({order.delivery_type.value}): ₹{delivery_fee}"
+        ]
+        
+        if user.strikes >= 2:
+            receipt_lines.append(f"Penalty Fee: ₹{BotConfig.PENALTY_FEE}")
+        
+        receipt_lines.append(f"\n*Total: ₹{order.total_cost}*")
+        return "*Your Printout Order:*\n\n" + "\n".join(receipt_lines)
+    
+    @staticmethod
+    def format_shopkeeper_message(order: Order, user: UserProfile) -> str:
+        """Format message for shopkeeper"""
+        if order.category == Category.PRINTOUT:
+            shopkeeper_receipt = MessageFormatter._format_printout_receipt(order, user)
+        else:
+            catalog = BotConfig.CATALOGS[order.category]
+            lines = [
+                f"- {catalog[c].name} x {q} = ₹{catalog[c].price * q}"
+                for c, q in order.items.items()
+            ]
+            
+            if order.delivery_type == DeliveryType.BULK:
+                lines.append(f"\n+ Delivery Charges = ₹{BotConfig.DELIVERY_FEE_BULK}")
+            else:
+                lines.append(f"\n+ Delivery Charges = ₹{BotConfig.DELIVERY_FEE_INSTANT}")
+            
+            if user.strikes > 0:
+                lines.append(f"\n+ Penalty Fee = ₹{BotConfig.PENALTY_FEE}")
+            
+            shopkeeper_receipt = "\n".join(lines)
+        
+        delivery_info = (f"🗓️ Bulk - {order.delivery_time}" 
+                        if order.delivery_type == DeliveryType.BULK 
+                        else "⚡ Instant")
+        
+        return (f"📦 *New Order ({order.category.value.title()})*\n\n"
+                f"👤 {user.name}\n📞 {user.phone}\n\n"
+                f"🚚 {delivery_info}\n\n"
+                f"🧾 *Details:*\n{shopkeeper_receipt}\n\n"
+                f"💰 *TOTAL: ₹{order.total_cost}*")
+
+
+class CostCalculator:
+    """Calculates order costs"""
+    
+    @staticmethod
+    def calculate_order_cost(order: Order, user: UserProfile) -> int:
+        """Calculate total cost for an order"""
+        if order.category == Category.PRINTOUT:
+            return CostCalculator._calculate_printout_cost(order, user)
+        else:
+            return CostCalculator._calculate_regular_cost(order, user)
+    
+    @staticmethod
+    def _calculate_regular_cost(order: Order, user: UserProfile) -> int:
+        """Calculate cost for regular orders"""
+        catalog = BotConfig.CATALOGS[order.category]
+        items_subtotal = sum(catalog[code].price * quantity 
+                            for code, quantity in order.items.items())
+        
+        delivery_fee = (BotConfig.DELIVERY_FEE_BULK 
+                       if order.delivery_type == DeliveryType.BULK 
+                       else BotConfig.DELIVERY_FEE_INSTANT)
+        
+        total = items_subtotal + delivery_fee
+        
+        if user.strikes >= 2:
+            total += BotConfig.PENALTY_FEE
+        
+        return total
+    
+    @staticmethod
+    def _calculate_printout_cost(order: Order, user: UserProfile) -> int:
+        """Calculate cost for printout orders"""
+        details = order.printout_details
+        price_per_page = (BotConfig.PRICE_COLOR_PER_PAGE 
+                         if details.color == PrintoutColor.COLOR 
+                         else BotConfig.PRICE_BW_PER_PAGE)
+        
+        print_cost = details.pages * price_per_page
+        delivery_fee = (BotConfig.DELIVERY_FEE_INSTANT 
+                       if order.delivery_type == DeliveryType.INSTANT 
+                       else BotConfig.DELIVERY_FEE_BULK)
+        
+        total = print_cost + delivery_fee
+        
+        if user.strikes >= 2:
+            total += BotConfig.PENALTY_FEE
+        
+        return total
+
+
+# ==================== ORDER MANAGER ====================
+class OrderManager:
+    """Manages order lifecycle and shopkeeper interactions"""
+    
+    def __init__(self, data_store: DataStore):
+        self.data_store = data_store
+        self.db = data_store.db
+    
+    async def send_to_shopkeepers(self, order: Order, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, int]:
+        """Send order to all relevant shopkeepers"""
+        user = self.data_store.get_user(order.user_id)
+        shopkeepers = BotConfig.SHOPKEEPERS.get(order.category, [])
+        message = MessageFormatter.format_shopkeeper_message(order, user)
+        
+        msg_ids = {}
+        for shop in shopkeepers:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", 
+                                   callback_data=f"approve_{order.user_id}_{shop.id}"),
+                InlineKeyboardButton("❌ Reject", 
+                                   callback_data=f"reject_{order.user_id}_{shop.id}")
+            ]])
+            
+            msg = await context.bot.send_message(
+                chat_id=shop.id,
+                text=message,
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+            msg_ids[str(shop.id)] = msg.message_id
+            
+            # Send PDF for printout orders
+            if order.category == Category.PRINTOUT:
+                await context.bot.send_document(
+                    chat_id=shop.id,
+                    document=order.printout_details.file_id
+                )
+        
+        return msg_ids
+    
+    async def approve_order(self, order: Order, shopkeeper_id: int, 
+                          context: ContextTypes.DEFAULT_TYPE):
+        """Handle order approval by shopkeeper"""
+        # Set order as accepted (flag)
+        order.is_accepted = True
+        order.status = OrderStatus.APPROVED
+        
+        # Find approving shopkeeper
+        shopkeepers = BotConfig.SHOPKEEPERS.get(order.category, [])
+        approving_shop = next((s for s in shopkeepers if s.id == shopkeeper_id), None)
+        
+        if approving_shop:
+            order.approved_by = approving_shop.phone
+        
+        user = self.data_store.get_user(order.user_id)
+        
+        # Delete messages from other shopkeepers
+        await self._remove_from_other_shopkeepers(order, shopkeeper_id, context)
+        
+        # Update approving shopkeeper's message
+        new_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Delivered", 
+                               callback_data=f"delivered_{order.user_id}"),
+            InlineKeyboardButton("🚫 Not Arrived", 
+                               callback_data=f"not_arrived_{order.user_id}")
+        ]])
+        
+        shop_msg_id = order.shopkeeper_msg_ids.get(str(shopkeeper_id))
+        if shop_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=shopkeeper_id,
+                    message_id=shop_msg_id,
+                    text=f"✅ *Order Approved*\n\n{MessageFormatter.format_shopkeeper_message(order, user)}",
+                    parse_mode="Markdown",
+                    reply_markup=new_keyboard
+                )
+            except Exception as e:
+                print(f"Error updating shopkeeper message: {e}")
+        # --- ADD THIS BLOCK (for Sales & Order persistence) ---
+        # 1. Log the sale to the 'sales' collection
+        sale_doc = {
+            "order_id": order.order_id,
+            "user_id": user.user_id,
+            "shopkeeper_phone": order.approved_by,
+            "category": order.category.value,
+            "total_cost": order.total_cost,
+            "created_at": order.created_at
+        }
+        self.db.sales.insert_one(sale_doc)
+        
+        # 2. Update the user's strikes in the database
+        if user.strikes > 0:
+            user.strikes = 0
+            self.data_store.update_user(user) # <-- Save strike change
+            
+        # 3. Finalize and save the order to the 'orders' collection
+        self.data_store.finalize_order(order.order_id)
+
+        # Log order
+        await self._log_order(order, user, "Approved", context)
+        
+        # Clear user strikes
+        if user.strikes > 0:
+            user.strikes = 0
+        
+        # Notify customer
+        await self._notify_customer_approved(order, user, context)
+    
+    async def reject_order(self, order: Order, shopkeeper_id: int, 
+                          context: ContextTypes.DEFAULT_TYPE):
+        """Handle order rejection by shopkeeper"""
+        # Add to rejections
+        order.rejections.add(str(shopkeeper_id))
+        
+        # Update message for this shopkeeper
+        user = self.data_store.get_user(order.user_id)
+        shop_msg_id = order.shopkeeper_msg_ids.get(str(shopkeeper_id))
+        
+        if shop_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=shopkeeper_id,
+                    message_id=shop_msg_id,
+                    text=f"❌ *Order Rejected*\n\n{MessageFormatter.format_shopkeeper_message(order, user)}",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                print(f"Error updating rejection message: {e}")
+        
+        # Check if all shopkeepers rejected
+        total_shopkeepers = len(BotConfig.SHOPKEEPERS.get(order.category, []))
+        if len(order.rejections) >= total_shopkeepers:
+            order.status = OrderStatus.REJECTED
+            await self._notify_customer_rejected(order, context)
+    
+    async def mark_delivered(self, order: Order, context: ContextTypes.DEFAULT_TYPE):
+        """Mark order as delivered"""
+        order.status = OrderStatus.DELIVERED
+        self.data_store.finalize_order(order.order_id)
+    
+    async def mark_not_arrived(self, order: Order, context: ContextTypes.DEFAULT_TYPE):
+        """Handle customer not arriving"""
+        user = self.data_store.get_user(order.user_id)
+        user.strikes += 1
+        order.status = OrderStatus.NOT_ARRIVED
+        self.data_store.update_user(user)
+        
+        # Log incident
+        await self._log_not_arrived(order, user, context)
+        
+        # Notify customer
+        await self._notify_customer_not_arrived(order, user, context)
+        
+        # Reset strikes to 0 after 2nd strike (when penalty is applied)
+        if user.strikes >= 2:
+            user.strikes = 0
+        
+        self.data_store.finalize_order(order.order_id)
+    
+    async def _remove_from_other_shopkeepers(self, order: Order, approved_by: int, 
+                                            context: ContextTypes.DEFAULT_TYPE):
+        """Delete order messages from shopkeepers who didn't approve"""
+        for shop_id_str, msg_id in order.shopkeeper_msg_ids.items():
+            if int(shop_id_str) != approved_by:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=int(shop_id_str),
+                        message_id=msg_id
+                    )
+                except Exception as e:
+                    print(f"Could not delete message for shopkeeper {shop_id_str}: {e}")
+    
+    async def _log_order(self, order: Order, user: UserProfile, 
+                        log_type: str, context: ContextTypes.DEFAULT_TYPE):
+        """Log order to admin channel"""
+        order_time = order.created_at.strftime("%Y-%m-%d %I:%M %p")
+        receipt = MessageFormatter.format_receipt(order, user)
+        
+        log_message = (f"📋 *Order Log ({log_type})*\n\n"
+                      f"👤 {user.name}\n⏰ {order_time}\n"
+                      f"Approved by: {order.approved_by}\n\n{receipt}")
+        
+        await context.bot.send_message(
+            chat_id=BotConfig.ORDER_LOG_CHANNEL_ID,
+            text=log_message,
+            parse_mode="Markdown"
+        )
+    
+    async def _log_not_arrived(self, order: Order, user: UserProfile, 
+                              context: ContextTypes.DEFAULT_TYPE):
+        """Log not arrived incident"""
+        receipt = MessageFormatter.format_receipt(order, user)
+        log_message = (f"🚫 *LOG: Customer Did Not Arrive*\n\n"
+                      f"👤 {user.name} (Strike {user.strikes})\n\n{receipt}")
+        
+        await context.bot.send_message(
+            chat_id=BotConfig.ORDER_LOG_CHANNEL_ID,
+            text=log_message,
+            parse_mode="Markdown"
+        )
+    
+    async def _notify_customer_approved(self, order: Order, user: UserProfile, 
+                                       context: ContextTypes.DEFAULT_TYPE):
+        """Notify customer of order approval"""
+        shopkeepers = BotConfig.SHOPKEEPERS.get(order.category, [])
+        
+        if order.delivery_type == DeliveryType.INSTANT:
+            if order.category == Category.STATIONERY:
+                # Stationery instant - show all shopkeeper numbers
+                phones = " / ".join([s.phone for s in shopkeepers])
+                message = (f"✅ Your order has been approved and will be delivered shortly!\n\n"
+                          f"Shopkeeper contact: ({phones})\n\n"
+                          f"Please call the shopkeeper ONLY if your order is not approved within 7 minutes from the time of order.\n\n"
+                          f"Thank you for your order!\n\n"
+                          f"• For complaints for the last order, type /complaint\n"
+                          f"• For feedback, type /feedback\n"
+                          f"• For a new order, type /start")
+            else:
+                # Other categories instant - show approved shopkeeper number
+                message = (f"✅ Your order has been approved by the shopkeeper ({order.approved_by}) "
+                          f"and will be delivered shortly!\n\n"
+                          f"Please call this number ONLY if your order is not approved within 7 minutes from the time of order.\n\n"
+                          f"Thank you for your order!\n\n"
+                          f"• For complaints for the last order, type /complaint\n"
+                          f"• For feedback, type /feedback\n"
+                          f"• For a new order, type /start")
+        else:  # Bulk delivery
+            if order.category == Category.STATIONERY:
+                # Stationery bulk - show approved shopkeeper number
+                message = (f"✅ Your order has been approved by the shopkeeper ({order.approved_by})!\n\n"
+                          f"Please call this number ONLY if your order doesn't arrive within 5 minutes of the scheduled delivery time.\n\n"
+                          f"Thank you for your order!\n\n"
+                          f"• For complaints for the last order, type /complaint\n"
+                          f"• For feedback, type /feedback\n"
+                          f"• For a new order, type /start")
+            else:
+                # Other categories bulk - show approved shopkeeper number
+                message = (f"✅ Your order has been approved by the shopkeeper ({order.approved_by})!\n\n"
+                          f"Please call this number ONLY if your order doesn't arrive within 5 minutes of the scheduled delivery time.\n\n"
+                          f"Thank you for your order!\n\n"
+                          f"• For complaints for the last order, type /complaint\n"
+                          f"• For feedback, type /feedback\n"
+                          f"• For a new order, type /start")
+        
+        await context.bot.send_message(chat_id=order.user_id, text=message)
+        self.data_store.finalize_order(order.order_id)
+    
+    async def _notify_customer_rejected(self, order: Order, 
+                                       context: ContextTypes.DEFAULT_TYPE):
+        """Notify customer of order rejection"""
+        message = ("Sorry, your last order has been rejected, maybe due to the item being out of stock.\n\n"
+                  "• For complaints for the last order, type /complaint\n"
+                  "• For feedback, type /feedback\n"
+                  "• For a new order, type /start")
+        
+        await context.bot.send_message(chat_id=order.user_id, text=message)
+        self.data_store.finalize_order(order.order_id)
+    
+    async def _notify_customer_not_arrived(self, order: Order, user: UserProfile, 
+                                          context: ContextTypes.DEFAULT_TYPE):
+        """Notify customer about not arriving"""
+        if user.strikes == 1:
+            message = (f"Hello, it seems you were not available to collect your recent order. "
+                      f"This is your first warning. "
+                      f"If this happens again, a penalty fee of ₹{BotConfig.PENALTY_FEE} will be added to your next order.\n\n"
+                      f"• For complaints for the last order, type /complaint\n"
+                      f"• For feedback, type /feedback\n"
+                      f"• For a new order, type /start")
+        else:  # strikes >= 2
+            message = (f"Hello, you were not available to collect your order again. "
+                      f"A penalty fee of ₹{BotConfig.PENALTY_FEE} will be added to your next order.\n\n"
+                      f"• For complaints for the last order, type /complaint\n"
+                      f"• For feedback, type /feedback\n"
+                      f"• For a new order, type /start")
+        
+        await context.bot.send_message(chat_id=order.user_id, text=message)
+
+
+# ==================== BOT HANDLER ====================
+class EcomBot:
+    """Main bot class that handles all interactions"""
+    # ... (inside class EcomBot, after the start method)
+    def __init__(self, db): # <-- ACCEPT DB
+        """Initializes the bot, data store, and order manager."""
+        self.db = db # <-- STORE DB
+        self.data_store = DataStore(db) # <-- PASS DB
+        self.order_manager = OrderManager(self.data_store)
+
+ # ... (inside class EcomBot, after the start method)
+
+    async def _process_email(self, email: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Helper to process email after confirmation"""
+        # 'update' is a CallbackQuery object here, not an Update object
+        chat_id = update.message.chat.id
+
+        existing_user = self.data_store.get_user_by_email(email)
+
+        if existing_user:
+            context.user_data['login_user_id'] = existing_user.user_id
+            keyboard = [[
+                InlineKeyboardButton("🔑 Login", callback_data="login"),
+                InlineKeyboardButton("📧 Use different email", callback_data="retry_email")
+            ]]
+            # We must use update.message.reply_text to send a new message with buttons
+            await update.message.reply_text(
+                "This email is already registered.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            # Edit the original "Processing..." message to be blank
+            await update.edit_message_text("Please choose an option above.")
+            return States.DUPLICATE_EMAIL
+
+        if not email.endswith("@iiitt.ac.in"):
+            # Edit the message to show the error and ask again
+            await update.edit_message_text(
+                "❌ Please use your *college email ID* (ending with @iiitt.ac.in).\n\nPlease enter your email again:",
+                parse_mode="Markdown"
+            )
+            return States.EMAIL
+
+        otp = str(random.randint(100000, 999999))
+
+        # --- CALL THE EMAIL FUNCTION ---
+        if MessageFormatter.send_otp_email(email, otp):
+            # If email sent successfully, create user and ask for OTP
+            self.data_store.create_user(chat_id, email, otp)
+            # Edit the "Processing..." message to show success
+            await update.edit_message_text(
+                "✅ Email accepted! Please enter the OTP we've sent to your email address.\n\n"
+                "(OTP not received? Type `send again`)"
+            )
+            return States.OTP
+        else:
+            # If email fails, edit the message to show error and ask again
+            await update.edit_message_text(
+                "❌ Sorry, there was a problem sending the OTP email. Please check the email address and try again."
+            )
+            return States.EMAIL
+        
+    async def handle_phone_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle phone confirmation"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "phone_confirm_no":
+            # Re-send the prompt from handle_name
+            contact_button = KeyboardButton("Share My Phone Number", request_contact=True)
+            reply_markup = ReplyKeyboardMarkup(
+                [[contact_button]],
+                one_time_keyboard=True,
+                resize_keyboard=True
+            )
+            await query.edit_message_text(
+                "Please share your phone number again using the button, or type it manually.\n\n"
+                "*Note: Please ensure it is a 12-digit number starting with `91`* (e.g., `91...`).",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+            return States.PHONE
+
+        # User confirmed "Yes"
+        phone_number = context.user_data.get('temp_phone')
+        if not phone_number:
+            await query.edit_message_text("Something went wrong. Please type /start again.")
+            return ConversationHandler.END
+
+        await query.edit_message_text("Saving phone number...")
+        # We pass query as the 'update' so _save_phone_and_proceed can edit the message
+        return await self._save_phone_and_proceed(phone_number, query, context)
+    
+    async def _save_phone_and_proceed(self, phone_number: str, update: Update,
+                                      context: ContextTypes.DEFAULT_TYPE):
+        """Helper to save phone after confirmation"""
+        # 'update' is a CallbackQuery object here
+        chat_id = update.message.chat.id
+
+        existing_user = self.data_store.get_user_by_phone(phone_number)
+        if existing_user:
+            # Edit the "Saving..." message to show the error
+            await update.edit_message_text(
+                "This phone number is already linked to another account.",
+                reply_markup=None # Remove inline buttons
+            )
+            
+            # Now, send a new message to re-prompt for the phone
+            contact_button = KeyboardButton("Share My Phone Number", request_contact=True)
+            reply_markup = ReplyKeyboardMarkup(
+                [[contact_button]],
+                one_time_keyboard=True,
+                resize_keyboard=True
+            )
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Please share a different phone number using the button below, or type it manually.\n\n"
+                    "*Note: Please ensure it is a 12-digit number starting with `91`* (e.g., `91...`)."
+                ),
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+            
+            return States.PHONE
+
+        user = self.data_store.get_user(chat_id)
+        user.phone = phone_number
+        self.data_store.update_user(user)
+
+        # We can't edit the message *and* show new delivery options in the same
+        # message, so we edit the "Saving..." message...
+        await update.edit_message_text(
+            "Phone number saved.",
+            reply_markup=None # Remove inline buttons
+        )
+        
+        # ...and then call _show_delivery_options to send a new message
+        # We must pass update.message (a Message object) here
+        return await self._show_delivery_options(update.message, context)
+    
+    # ===== START & AUTHENTICATION =====
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        rain_alert = "🌧️ *RAIN ALERT:* Deliveries are delayed!\n\n" if self.data_store.is_raining else ""
+        user_id = update.effective_chat.id
+        user = self.data_store.get_user(user_id)
+        
+        if user and user.name:
+            await update.message.reply_text(
+                f"{rain_alert}Welcome back, {user.name}!",
+                parse_mode="Markdown"
+            )
+            user.current_order = None
+            return await self._show_delivery_options(update, context)
+        else:
+            await update.message.reply_text(
+                f"{rain_alert}Welcome! Please enter your *college email ID* (ending with @iiitt.ac.in):",
+                parse_mode="Markdown"
+            )
+            return States.EMAIL
+    
+    async def handle_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle email input and ask for confirmation"""
+        email = update.message.text.strip().lower()
+        context.user_data['temp_email'] = email
+
+        keyboard = [[
+            InlineKeyboardButton("✅ Yes", callback_data="email_confirm_yes"),
+            InlineKeyboardButton("🔄 Enter Again", callback_data="email_confirm_no")
+        ]]
+        await update.message.reply_text(
+            f"You entered: `{email}`\n\nIs this correct?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.EMAIL_CONFIRM
+    async def handle_email_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle email confirmation"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "email_confirm_no":
+            await query.edit_message_text("Please enter your college email ID again:")
+            return States.EMAIL
+
+        # User confirmed "Yes"
+        email = context.user_data.get('temp_email')
+        if not email:
+            await query.edit_message_text("Something went wrong. Please type /start again.")
+            return ConversationHandler.END
+
+        await query.edit_message_text("Processing your email...")
+        # We pass query.message as the 'update' so it can reply
+        return await self._process_email(email, query, context)
+    
+    # ... (Keep the rest of the EcomBot methods)
+    
+    async def handle_duplicate_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle duplicate email scenario"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == 'retry_email':
+            await query.edit_message_text("Please enter a different email ID.")
+            return States.EMAIL
+        
+        if query.data == 'login':
+            original_user_id = context.user_data.get('login_user_id')
+            if not original_user_id:
+                await query.edit_message_text("Something went wrong. Please type /start again.")
+                return ConversationHandler.END
+            
+            original_user = self.data_store.get_user(original_user_id)
+            otp = str(random.randint(100000, 999999))
+            original_user.login_otp = otp
+            
+            print(f"Login OTP for {original_user.email}: {otp}")
+            # --- ALSO SEND THE EMAIL HERE ---
+            MessageFormatter.send_otp_email(original_user.email, otp)
+            # ---
+            await query.edit_message_text(
+                "A new OTP has been sent. Please enter it to log in.\n\n"
+                "(OTP not received? Type `send again`)"
+            )
+            return States.LOGIN_OTP
+    
+    async def handle_login_otp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle login OTP verification"""
+        entered_otp = update.message.text.strip()
+        original_user_id = context.user_data.get('login_user_id')
+        original_user = self.data_store.get_user(original_user_id)
+
+        if entered_otp.lower() == "send again":
+            if not original_user:
+                await update.message.reply_text("User data not found. Please /start again.")
+                return ConversationHandler.END
+            
+            otp = str(random.randint(100000, 999999))
+            original_user.login_otp = otp
+            
+            if MessageFormatter.send_otp_email(original_user.email, otp):
+                await update.message.reply_text("We've sent a new OTP. Please check your email.")
+            else:
+                await update.message.reply_text("Sorry, there was a problem resending the OTP. Please try again in a moment.")
+            return States.LOGIN_OTP
+
+        if original_user and entered_otp == original_user.login_otp:
+            current_user_id = update.effective_chat.id
+            
+            # Transfer user data to current chat
+            self.data_store.users[current_user_id] = original_user
+            original_user.user_id = current_user_id
+            original_user.login_otp = None
+            original_user.current_order = None
+            
+            await update.message.reply_text(
+                f"✅ Login successful! Welcome back, {original_user.name}."
+            )
+            return await self._show_delivery_options(update, context)
+        else:
+            await update.message.reply_text("❌ Incorrect OTP. Please try again.")
+            return States.LOGIN_OTP
+        
+    async def handle_otp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle OTP verification for new users"""
+        user_id = update.effective_chat.id
+        user = self.data_store.get_user(user_id)
+        entered_text = update.message.text.strip()
+
+        if entered_text.lower() == "send again":
+            if not user:
+                await update.message.reply_text("User data not found. Please /start again.")
+                return ConversationHandler.END
+            
+            otp = str(random.randint(100000, 999999))
+            user.otp = otp
+            
+            if MessageFormatter.send_otp_email(user.email, otp):
+                await update.message.reply_text("We've sent a new OTP. Please check your email.")
+            else:
+                await update.message.reply_text("Sorry, there was a problem resending the OTP. Please try again in a moment.")
+            return States.OTP
+
+        if user and entered_text == user.otp:
+            await update.message.reply_text("✅ OTP verified! Please enter your full name.")
+            return States.NAME
+        else:
+            await update.message.reply_text("❌ Incorrect OTP. Please try again.")
+            return States.OTP
+    
+    async def handle_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle name input"""
+        user_id = update.effective_chat.id
+        user = self.data_store.get_user(user_id)
+        user.name = update.message.text.strip()
+        self.data_store.update_user(user)
+        
+        contact_button = KeyboardButton("Share My Phone Number", request_contact=True)
+        reply_markup = ReplyKeyboardMarkup(
+            [[contact_button]],
+            one_time_keyboard=True,
+            resize_keyboard=True
+        )
+        
+        await update.message.reply_text(
+        f"Thank you, {user.name}.\n\n"
+        f"Please share your phone number using the button below, or type it manually.\n\n"
+        f"*Note: Please ensure it is a 12-digit number starting with `91`* (e.g., `91...`).",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+        return States.PHONE
+    
+    async def handle_phone_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle phone number via contact share"""
+        return await self._process_phone(
+            update.message.contact.phone_number,
+            update,
+            context
+        )
+    
+    async def handle_phone_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle phone number via text"""
+        return await self._process_phone(
+            update.message.text.strip(),
+            update,
+            context
+        )
+    
+    async def _process_phone(self, phone_number: str, update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+        """Process and validate phone number input, then ask for confirmation"""
+        
+        # Normalize phone number
+        phone_number = phone_number.strip().lstrip('+')
+        if len(phone_number) == 10 and not phone_number.startswith("91"):
+            phone_number = "91" + phone_number
+            
+        # Validate phone number
+        if not (phone_number.isdigit() and len(phone_number) == 12 and phone_number.startswith("91")):
+            await update.message.reply_text(
+                "❌ Invalid format. Please provide a 12-digit number starting with `91` (e.g., `91...`).\n\n"
+                "You can also use the 'Share My Phone Number' button.",
+                reply_markup=update.message.reply_markup # Keep the keyboard
+            )
+            return States.PHONE
+
+        # Ask for confirmation
+        context.user_data['temp_phone'] = phone_number
+        keyboard = [[
+            InlineKeyboardButton("✅ Yes", callback_data="phone_confirm_yes"),
+            InlineKeyboardButton("🔄 Enter Again", callback_data="phone_confirm_no")
+        ]]
+        await update.message.reply_text(
+            f"You entered: `{phone_number}`\n\nIs this correct?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.PHONE_CONFIRM
+    async def export_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Exports database collections to an Excel file (admin only)"""
+        
+        # 1. Check if the user is an admin
+        if update.effective_chat.id not in BotConfig.ADMIN_IDS:
+            await update.message.reply_text("You are not authorized for this action.")
+            return
+
+        await update.message.reply_text("Generating database export... ⏳")
+
+        try:
+            # 2. Fetch data from all 4 collections
+            users_data = list(self.db.users.find())
+            orders_data = list(self.db.orders.find())
+            complaints_data = list(self.db.complaints.find())
+            sales_data = list(self.db.sales.find())
+
+            # 3. Convert data to pandas DataFrames
+            df_users = pd.DataFrame(users_data)
+            df_orders = pd.DataFrame(orders_data)
+            df_complaints = pd.DataFrame(complaints_data)
+            df_sales = pd.DataFrame(sales_data)
+
+            # 4. Create an in-memory Excel file
+            output_buffer = io.BytesIO()
+            
+            # Use ExcelWriter to save multiple sheets
+            with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+                df_users.to_excel(writer, sheet_name='Users', index=False)
+                df_orders.to_excel(writer, sheet_name='Orders', index=False)
+                df_complaints.to_excel(writer, sheet_name='Complaints', index=False)
+                df_sales.to_excel(writer, sheet_name='Sales', index=False)
+            
+            # Go back to the start of the in-memory file
+            output_buffer.seek(0)
+
+            # 5. Send the file to the admin
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            filename = f"bot_export_{timestamp}.xlsx"
+
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=output_buffer,
+                filename=filename,
+                caption="Here is the database export."
+            )
+
+        except Exception as e:
+            print(f"Error during export: {e}")
+            await update.message.reply_text(f"An error occurred while generating the export: {e}")
+    
+    
+    # ===== DELIVERY & CATEGORY SELECTION =====
+    async def _show_delivery_options(self, update_or_msg, context: ContextTypes.DEFAULT_TYPE):
+        """Show delivery type options (handles Update or Message)"""
+        if self.data_store.is_raining:
+            keyboard = [[InlineKeyboardButton("🗓️ Bulk", callback_data="bulk")]]
+            message_text = "Please choose your delivery type. (Instant delivery is currently unavailable due to rain)."
+        else:
+            keyboard = [[
+                InlineKeyboardButton("🗓️ Bulk", callback_data="bulk"),
+                InlineKeyboardButton("⚡ Instant (20 mins)", callback_data="instant")
+            ]]
+            message_text = "Please choose your delivery type:"
+
+        # Check if we got the full Update object (with a query) or just a Message
+        if hasattr(update_or_msg, 'callback_query') and update_or_msg.callback_query:
+            # This came from /start on a logged-in user (or elsewhere)
+            await update_or_msg.callback_query.edit_message_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        elif hasattr(update_or_msg, 'message'): 
+            # This is an Update object from a text command
+             await update_or_msg.message.reply_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # This is a Message object (passed from _save_phone_and_proceed)
+            await update_or_msg.reply_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        return States.DELIVERY_TYPE
+    
+    async def handle_delivery_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle delivery type selection"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "instant":
+            # Check if instant delivery is available
+            now = datetime.now().time()
+            if not (time(10, 30) <= now <= time(21, 10)):
+                keyboard = [[
+                    InlineKeyboardButton("🗓️ Switch to Bulk", callback_data="bulk"),
+                    InlineKeyboardButton("❌ Cancel Order", callback_data="cancel_instant")
+                ]]
+                await query.edit_message_text(
+                    "⏰ Sorry! Instant orders are taken from *10:30 AM to 9:10 PM*.\n\n"
+                    "Would you like to:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+                return States.DELIVERY_TYPE
+            
+            context.user_data['delivery_type'] = DeliveryType.INSTANT
+            return await self._show_category_options(query, context)
+        elif query.data == "bulk":
+            context.user_data['delivery_type'] = DeliveryType.BULK
+            keyboard, text = TimeValidator.get_bulk_delivery_options()
+            await query.edit_message_text(
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.BULK_TIME
+        elif query.data == "cancel_instant":
+            await query.edit_message_text(
+                "Thank you for your time! We look forward to serving you again.\n\n"
+                "• To provide feedback, type /feedback\n"
+                "• For a new order, type /start"
+            )
+            return ConversationHandler.END
+    
+    async def handle_bulk_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle bulk delivery time selection"""
+        query = update.callback_query
+        await query.answer()
+        
+        chosen_time_slot = next(
+            (b.text for row in query.message.reply_markup.inline_keyboard 
+             for b in row if b.callback_data == query.data),
+            "Unknown"
+        )
+        context.user_data['delivery_time'] = chosen_time_slot
+        return await self._show_category_options(query, context)
+    
+    async def _show_category_options(self, query_or_update, context: ContextTypes.DEFAULT_TYPE):
+        """Show category selection options"""
+        rain_disclaimer = ("\n\n*Please note:* Due to the rain, your delivery may be delayed." 
+                          if self.data_store.is_raining else "")
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🛒 Grocery", callback_data="cat_grocery"),
+                InlineKeyboardButton("📝 Stationery", callback_data="cat_stationery")
+            ],
+            [
+                InlineKeyboardButton("⚕️ Medical", callback_data="cat_medical"),
+                InlineKeyboardButton("📄 Printout", callback_data="cat_printout")
+            ]
+        ]
+        text = f"Great! What category of items are you looking for?{rain_disclaimer}"
+        
+        if isinstance(query_or_update, Update):
+            await query_or_update.message.reply_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        else:
+            await query_or_update.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        return States.CATEGORY
+    
+    async def handle_category(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle category selection"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+        
+        category_str = query.data.split('_')[1]
+        category = Category(category_str)
+        delivery_type = context.user_data.get('delivery_type')
+        
+        # Create order
+        order = self.data_store.create_order(user_id, category, delivery_type)
+        
+        if delivery_type == DeliveryType.BULK:
+            order.delivery_time = context.user_data.get('delivery_time')
+        
+        if category == Category.PRINTOUT:
+            keyboard = [[
+                InlineKeyboardButton("Color", callback_data="p_color"),
+                InlineKeyboardButton("Black & White", callback_data="p_bw")
+            ]]
+            await query.edit_message_text(
+                "Please choose the printout type:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.PRINTOUT_COLOR
+        else:
+            await query.edit_message_text(
+                text=MessageFormatter.format_catalog(category),
+                parse_mode="Markdown"
+            )
+            return States.ORDER
+    
+    # ===== PRINTOUT HANDLING =====
+    async def handle_printout_color(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle printout color selection"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+        user = self.data_store.get_user(user_id)
+        
+        color = PrintoutColor(query.data)
+        context.user_data['printout_color'] = color
+        
+        keyboard = [[
+            InlineKeyboardButton("Single Sided", callback_data="p_single"),
+            InlineKeyboardButton("Front and Back", callback_data="p_double")
+        ]]
+        await query.edit_message_text(
+            "Please choose the sidedness:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.PRINTOUT_SIDES
+    
+    async def handle_printout_sides(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle printout sides selection"""
+        query = update.callback_query
+        await query.answer()
+        
+        sides = PrintoutSides(query.data)
+        context.user_data['printout_sides'] = sides
+        
+        await query.edit_message_text("Please upload your PDF file now.")
+        return States.PRINTOUT_UPLOAD
+    
+    async def handle_printout_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle PDF upload for printout"""
+        user_id = update.effective_chat.id
+        user = self.data_store.get_user(user_id)
+        order = user.current_order
+        doc = update.message.document
+        
+        if not doc.mime_type == 'application/pdf':
+            await update.message.reply_text("❌ Please upload a PDF file only.")
+            return States.PRINTOUT_UPLOAD
+        
+        # Download and count pages
+        file = await context.bot.get_file(doc.file_id)
+        file_path = f"{doc.file_id}.pdf"
+        await file.download_to_drive(file_path)
+        
+        try:
+            with open(file_path, 'rb') as f:
+                page_count = len(PyPDF2.PdfReader(f).pages)
+        except Exception as e:
+            await update.message.reply_text(
+                f"Sorry, I couldn't read the pages from this PDF. Error: {e}"
+            )
+            return States.PRINTOUT_UPLOAD
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        
+        # Create printout details
+        color = context.user_data.get('printout_color')
+        sides = context.user_data.get('printout_sides')
+        
+        order.printout_details = PrintoutDetails(
+            color=color,
+            sides=sides,
+            file_id=doc.file_id,
+            file_name=doc.file_name,
+            pages=page_count
+        )
+        
+        # Calculate cost
+        order.total_cost = CostCalculator.calculate_order_cost(order, user)
+        
+        # Show receipt
+        receipt_text = MessageFormatter.format_receipt(order, user)
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_final"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_final")
+        ]]
+        
+        await update.message.reply_text(
+            receipt_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.CONFIRM
+    
+    # ===== REGULAR ORDER HANDLING =====
+    async def handle_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle item selection for regular orders"""
+        user_id = update.effective_chat.id
+        user = self.data_store.get_user(user_id)
+        order = user.current_order
+        text = update.message.text.strip().upper()
+        catalog = BotConfig.CATALOGS.get(order.category, {})
+        
+        if text == "DONE":
+            return await self._finalize_cart(user, order, update, context)
+        
+        try:
+            # Parse input
+            parts = text.split()
+            is_deduct = '-' in text and len(parts) == 3 and parts[1] == '-'
+            
+            if is_deduct:
+                code, _, quantity_str = parts
+                quantity = int(quantity_str)
+                
+                if code not in catalog:
+                    await update.message.reply_text(f"❌ Unknown item code: {code}.")
+                    return States.ORDER
+                
+                if code not in order.items:
+                    await update.message.reply_text(
+                        f"You haven't added {catalog[code].name} yet."
+                    )
+                    return States.ORDER
+                
+                if quantity > order.items[code]:
+                    await update.message.reply_text(
+                        f"Can't remove {quantity}, you only have {order.items[code]}."
+                    )
+                    return States.ORDER
+                
+                order.items[code] -= quantity
+                if order.items[code] == 0:
+                    del order.items[code]
+                
+                action_text = f"➖ Removed: {catalog[code].name} x{quantity}."
+            else:
+                if len(parts) != 2:
+                    raise ValueError()
+                
+                code, quantity_str = parts
+                quantity = int(quantity_str)
+                
+                if code not in catalog:
+                    await update.message.reply_text(f"❌ Unknown item code: {code}.")
+                    return States.ORDER
+                
+                if quantity <= 0:
+                    raise ValueError()
+                
+                order.items[code] = order.items.get(code, 0) + quantity
+                action_text = f"✅ Added: {catalog[code].name} x{quantity}."
+            
+            # Show updated cart
+            current_cart_text = MessageFormatter.format_cart(order)
+            subtotal = sum(catalog[c].price * q for c, q in order.items.items())
+            deduct_prompt = "\n(To remove, type `S1 - 1`)" if order.items else ""
+            
+            await update.message.reply_text(
+                f"{action_text}\n\n{current_cart_text}\n*Current subtotal: ₹{subtotal}*.\n\n"
+                f"Add more, type 'done', or remove items.{deduct_prompt}",
+                parse_mode="Markdown"
+            )
+            return States.ORDER
+            
+        except (ValueError, IndexError):
+            await update.message.reply_text(
+                "❌ Invalid format.\nPlease use `S1 2` to add or `S1 - 1` to remove.\n\n"
+                "To cancel this order and start again, type /start."
+            )
+            return States.ORDER
+    
+    async def _finalize_cart(self, user: UserProfile, order: Order, 
+                            update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Finalize cart and show receipt"""
+        if not order.items:
+            await update.message.reply_text(
+                "You haven't added any items yet.\n\n"
+                "To cancel this order and start again, type /start"
+            )
+            return States.ORDER
+        
+        catalog = BotConfig.CATALOGS[order.category]
+        items_subtotal = sum(catalog[code].price * quantity 
+                            for code, quantity in order.items.items())
+        
+        # Check minimum order
+        min_order = (BotConfig.MIN_ORDER_BULK 
+                    if order.delivery_type == DeliveryType.BULK 
+                    else BotConfig.MIN_ORDER_INSTANT)
+        
+        if items_subtotal < min_order:
+            await update.message.reply_text(
+                f"Min order for {order.delivery_type.value.lower()} is ₹{min_order}. "
+                f"Your subtotal is ₹{items_subtotal}. Please add more."
+            )
+            return States.ORDER
+        
+        # Calculate total cost
+        order.total_cost = CostCalculator.calculate_order_cost(order, user)
+        
+        # Show receipt
+        receipt_text = MessageFormatter.format_receipt(order, user)
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_final"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_final")
+        ]]
+        
+        await update.message.reply_text(
+            f"{receipt_text}\n\nPlease confirm your order.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.CONFIRM
+    
+    # ===== ORDER CONFIRMATION =====
+    async def handle_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle order confirmation"""
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+        user = self.data_store.get_user(user_id)
+        order = user.current_order
+        
+        original_receipt = query.message.text_markdown
+        
+        if query.data == "cancel_final":
+            order.status = OrderStatus.CANCELLED
+            cancel_message = ("Thank you for your time! We look forward to serving you again.\n\n"
+                            "• For complaints for the last order, type /complaint\n"
+                            "• To provide feedback, type /feedback\n"
+                            "• For a new order, type /start")
+            
+            await query.edit_message_text(
+                f"{original_receipt}\n\n---\n*Order Cancelled.*\n\n{cancel_message}",
+                parse_mode="Markdown"
+            )
+            self.data_store.finalize_order(order.order_id)
+            return ConversationHandler.END
+        
+        # Validate timing
+        is_valid_time = TimeValidator.is_valid_delivery_time(
+            order.delivery_type,
+            order.delivery_time or ""
+        )
+        
+        if not is_valid_time:
+            order.status = OrderStatus.CANCELLED
+            timeout_message = ("😔 Oops! You've just missed the cutoff...\n"
+                             "Don't worry — you can still schedule your delivery for the next available slot!\n\n"
+                             "• For a new order, type /start\n"
+                             "• For feedback, type /feedback\n"
+                             "• For complaints for the last order, type /complaint")
+            
+            await query.edit_message_text(
+                f"{original_receipt}\n\n---\n{timeout_message}",
+                parse_mode="Markdown"
+            )
+            self.data_store.finalize_order(order.order_id)
+            return ConversationHandler.END
+        
+        # Send to shopkeepers
+        msg_ids = await self.order_manager.send_to_shopkeepers(order, context)
+        order.shopkeeper_msg_ids = msg_ids
+        
+        await query.edit_message_text(
+            f"{original_receipt}\n\n---",
+            parse_mode="Markdown"
+        )
+        
+        # Notify customer
+        if order.delivery_type == DeliveryType.INSTANT:
+            shopkeepers = BotConfig.SHOPKEEPERS.get(order.category, [])
+            
+            if order.category == Category.STATIONERY:
+                # Stationery - show all shopkeeper numbers
+                phones = " / ".join([s.phone for s in shopkeepers])
+                message = (f"✅ Order sent! Waiting for approval.\n\n"
+                          f"Shopkeeper contact: ({phones})\n\n"
+                          f"Please call the shopkeeper ONLY if your order is not approved within 7 minutes from the time of order.")
+            else:
+                # Other categories - show single shopkeeper number
+                phones = shopkeepers[0].phone if shopkeepers else "N/A"
+                message = (f"✅ Order sent! Waiting for approval.\n\n"
+                          f"Shopkeeper contact: ({phones})\n\n"
+                          f"Please call the shopkeeper ONLY if your order is not approved within 7 minutes from the time of order.")
+            
+            await context.bot.send_message(chat_id=user_id, text=message)
+        else:
+            # Bulk delivery
+            shopkeepers = BotConfig.SHOPKEEPERS.get(order.category, [])
+            
+            if order.category == Category.STATIONERY:
+                # Stationery - show all shopkeeper numbers
+                phones = " / ".join([s.phone for s in shopkeepers])
+                final_message = (f"✅ Order confirmed! The shopkeeper will receive it shortly.\n\n"
+                               f"Shopkeeper contact: ({phones})\n\n"
+                               f"Please call the shopkeeper ONLY if your order doesn't arrive within 5 minutes of the scheduled delivery time.\n\n"
+                               f"Thank you for your order!\n\n"
+                               f"• For complaints for the last order, type /complaint\n"
+                               f"• For feedback, type /feedback\n"
+                               f"• For a new order, type /start")
+            else:
+                # Other categories - show single shopkeeper number
+                phones = shopkeepers[0].phone if shopkeepers else "N/A"
+                final_message = (f"✅ Order confirmed! The shopkeeper will receive it shortly.\n\n"
+                               f"Shopkeeper contact: ({phones})\n\n"
+                               f"Please call the shopkeeper ONLY if your order doesn't arrive within 5 minutes of the scheduled delivery time.\n\n"
+                               f"Thank you for your order!\n\n"
+                               f"• For complaints for the last order, type /complaint\n"
+                               f"• For feedback, type /feedback\n"
+                               f"• For a new order, type /start")
+            
+            await context.bot.send_message(chat_id=user_id, text=final_message)
+        
+        return ConversationHandler.END
+    
+    # ===== SHOPKEEPER RESPONSES =====
+    async def handle_shopkeeper_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle shopkeeper approval/rejection/delivery status"""
+        query = update.callback_query
+        await query.answer()
+        
+        callback_data = query.data
+        
+        # Parse callback data - handle multi-word actions
+        if callback_data.startswith('not_arrived_'):
+            action = 'not_arrived'
+            user_id = int(callback_data.replace('not_arrived_', ''))
+        elif callback_data.startswith('approve_'):
+            parts = callback_data.split('_')
+            action = 'approve'
+            user_id = int(parts[1])
+        elif callback_data.startswith('reject_'):
+            parts = callback_data.split('_')
+            action = 'reject'
+            user_id = int(parts[1])
+        elif callback_data.startswith('delivered_'):
+            action = 'delivered'
+            user_id = int(callback_data.replace('delivered_', ''))
+        else:
+            await query.edit_message_text("Invalid action.")
+            return
+        
+        # Get user and their current order
+        user = self.data_store.get_user(user_id)
+        if not user:
+            await query.edit_message_text("User not found.")
+            return
+        
+        # For approve/reject, use current_order; for delivered/not_arrived, use last_order
+        if action in ['approve', 'reject']:
+            order = user.current_order
+        else:
+            order = user.last_order
+        
+        if not order:
+            await query.edit_message_text("Order not found.")
+            return
+        
+        # Check if order already accepted (flag check)
+        if order.is_accepted and action in ['approve', 'reject']:
+            await query.answer("This order has already been processed by another shopkeeper.", show_alert=True)
+            return
+        
+        shopkeeper_id = query.from_user.id
+        
+        if action == 'approve':
+            await self.order_manager.approve_order(order, shopkeeper_id, context)
+        elif action == 'reject':
+            await self.order_manager.reject_order(order, shopkeeper_id, context)
+        elif action == 'delivered':
+            await self.order_manager.mark_delivered(order, context)
+            await query.edit_message_text(
+                f"✅ *Marked as Delivered*\n\n{query.message.text_markdown}",
+                parse_mode="Markdown"
+            )
+        elif action == 'not_arrived':
+            await self.order_manager.mark_not_arrived(order, context)
+            await query.edit_message_text(
+                f"🚫 *Marked as 'Not Arrived'*\n\n{query.message.text_markdown}",
+                parse_mode="Markdown"
+            )
+    
+    # ===== FEEDBACK & COMPLAINTS =====
+    async def start_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start feedback conversation"""
+        user = self.data_store.get_user(update.effective_chat.id)
+        if not user or not user.name:
+            await update.message.reply_text("Please place an order first. Type /start.")
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            "Please provide your feedback. Your feedback will help us improve our services.\n"
+            "Type /cancel to abort."
+        )
+        return States.FEEDBACK_TEXT
+    
+    async def handle_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle feedback submission"""
+        user = self.data_store.get_user(update.effective_chat.id)
+        message_to_forward = (f"📝 *Feedback*\n\n"
+                             f"👤 {user.name}\n📞 {user.phone}\n\n"
+                             f"*Message:*\n{update.message.text}")
+        
+        await context.bot.send_message(
+            chat_id=BotConfig.FEEDBACK_CHANNEL_ID,
+            text=message_to_forward,
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(
+            "Thank you for your feedback. For a new order, type /start."
+        )
+        return ConversationHandler.END
+    
+    async def start_complaint(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start complaint conversation"""
+        user = self.data_store.get_user(update.effective_chat.id)
+        if not user or not user.last_order:
+            await update.message.reply_text(
+                "You must have a recent completed order. Type /start."
+            )
+            return ConversationHandler.END
+        
+        await update.message.reply_text(
+            "Please type your complaint below.\nType /cancel to abort."
+        )
+        return States.COMPLAINT_TEXT
+    
+    async def handle_complaint(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle complaint submission"""
+        user = self.data_store.get_user(update.effective_chat.id)
+        order = user.last_order
+        
+        receipt = MessageFormatter.format_receipt(order, user)
+        message_to_forward = (f"🚨 *Complaint*\n\n"
+                             f"👤 {user.name}\n📞 {user.phone}\n\n"
+                             f"Status: *{order.status.value}*\n\n"
+                             f"🧾 *Receipt:*\n{receipt}\n\n"
+                             f"💬 *Complaint:*\n{update.message.text}")
+        complaint_doc = {
+            "user_id": user.user_id,
+            "user_name": user.name,
+            "user_phone": user.phone,
+            "order_id": order.order_id,
+            "order_status": order.status.value,
+            "complaint_text": update.message.text,
+            "created_at": datetime.now()
+        }
+        self.db.complaints.insert_one(complaint_doc)
+
+        await context.bot.send_message(
+            chat_id=BotConfig.COMPLAINT_CHANNEL_ID,
+            text=message_to_forward,
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(
+            "We have received your complaint and will get back to you. "
+            "For a new order, type /start."
+        )
+        return ConversationHandler.END
+    
+    # ===== ADMIN COMMANDS =====
+    async def rain_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enable rain mode (admin only)"""
+        if update.effective_chat.id in BotConfig.ADMIN_IDS:
+            self.data_store.is_raining = True
+            await update.message.reply_text("🌧️ Rain Delay Mode ACTIVATED.")
+        else:
+            await update.message.reply_text("You are not authorized.")
+    
+    async def rain_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Disable rain mode (admin only)"""
+        if update.effective_chat.id in BotConfig.ADMIN_IDS:
+            self.data_store.is_raining = False
+            await update.message.reply_text("✅ Rain Delay Mode DEACTIVATED.")
+        else:
+            await update.message.reply_text("You are not authorized.")
+    
+    # ===== UTILITY =====
+    async def cancel_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel current order"""
+        user_id = update.effective_chat.id
+        user = self.data_store.get_user(user_id)
+        
+        if user and user.current_order:
+            user.current_order = None
+        
+        await update.message.reply_text(
+            "❌ Order cancelled. Type /start to begin again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+    
+    async def cancel_feedback_complaint(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel feedback/complaint"""
+        await update.message.reply_text(
+            "Process cancelled. For a new order, type /start."
+        )
+        return ConversationHandler.END
+    
+    async def pre_start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle messages before /start"""
+        await update.message.reply_text("Please start by typing /start")
+    
+    # ===== BUILD APPLICATION =====
+    def build_application(self):
+        """Build and configure the application"""
+        app = ApplicationBuilder().token(BotConfig.TOKEN).build()
+        
+        # Main order conversation
+        order_conv = ConversationHandler(
+            entry_points=[CommandHandler("start", self.start)],
+            states={
+                States.EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_email)],
+                States.EMAIL_CONFIRM: [CallbackQueryHandler(self.handle_email_confirm)], # <-- ADD THIS
+                States.DUPLICATE_EMAIL: [CallbackQueryHandler(self.handle_duplicate_email)],
+                States.LOGIN_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_login_otp)],
+                States.OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_otp)],
+                States.NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_name)],
+                States.PHONE: [
+                    MessageHandler(filters.CONTACT, self.handle_phone_contact),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_phone_text)
+                ],
+                States.PHONE_CONFIRM: [CallbackQueryHandler(self.handle_phone_confirm)],
+                States.DELIVERY_TYPE: [CallbackQueryHandler(self.handle_delivery_type)],
+                States.BULK_TIME: [CallbackQueryHandler(self.handle_bulk_time)],
+                States.CATEGORY: [CallbackQueryHandler(self.handle_category)],
+                States.ORDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_order)],
+                States.PRINTOUT_COLOR: [CallbackQueryHandler(self.handle_printout_color)],
+                States.PRINTOUT_SIDES: [CallbackQueryHandler(self.handle_printout_sides)],
+                States.PRINTOUT_UPLOAD: [MessageHandler(filters.Document.PDF, self.handle_printout_upload)],
+                States.CONFIRM: [CallbackQueryHandler(self.handle_confirmation)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_order)],
+            allow_reentry=True
+        )
+        
+        # Feedback conversation
+        feedback_conv = ConversationHandler(
+            entry_points=[CommandHandler("feedback", self.start_feedback)],
+            states={
+                States.FEEDBACK_TEXT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_feedback)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_feedback_complaint)]
+        )
+        
+        # Complaint conversation
+        complaint_conv = ConversationHandler(
+            entry_points=[CommandHandler("complaint", self.start_complaint)],
+            states={
+                States.COMPLAINT_TEXT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_complaint)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", self.cancel_feedback_complaint)]
+        )
+        
+        # Add all handlers
+        app.add_handler(order_conv)
+        app.add_handler(feedback_conv)
+        app.add_handler(complaint_conv)
+        app.add_handler(
+            CallbackQueryHandler(
+                self.handle_shopkeeper_response,
+                pattern=r"^(approve|reject|delivered|not_arrived)_.+"
+            )
+        )
+        app.add_handler(CommandHandler("rain_start", self.rain_start))
+        app.add_handler(CommandHandler("rain_stop", self.rain_stop))
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.pre_start_handler)
+        )
+        app.add_handler(CommandHandler("export", self.export_data))
+        
+        return app
+
+
+# ==================== MAIN ====================
+def main():
+    """Main entry point"""
+    
+    # --- ADD THIS BLOCK ---
+    # Connect to MongoDB
+    # Replace with your connection string
+    MONGO_CONNECTION_STRING = "your uri" 
+    try:
+        client = pymongo.MongoClient(MONGO_CONNECTION_STRING, serverSelectionTimeoutMS=5000)
+        client.server_info() # Test the connection
+        print("✅ Connected to MongoDB.")
+        db = client.get_database("telegram_bot_db") # Your database name
+    except Exception as e:
+        print(f"❌ Could not connect to MongoDB: {e}")
+        return
+    # --- END OF BLOCK ---
+
+    print("🤖 Initializing E-commerce Bot...")
+    
+    bot = EcomBot(db) # <-- PASS THE DB TO THE BOT
+    app = bot.build_application()
+    
+    print("✅ Bot is running... Press Ctrl + C to stop.")
+    app.run_polling()
+    # In your main() function, after connecting:
+db = client["telegram_bot_db"]
+
+# 1. Users (Permanent)
+# No TTL needed. A unique index on user_id is good practice.
+db.users.create_index("user_id", unique=True)
+
+# 2. Orders (2 Weeks)
+# Stores order history.
+# 2 weeks = 1,209,600 seconds
+db.orders.create_index("created_at", expireAfterSeconds=1209600)
+
+# 3. Complaints (2 Weeks)
+# New collection for complaints.
+db.complaints.create_index("created_at", expireAfterSeconds=1209600)
+
+# 4. Sales (2 Months)
+# New collection for sales analysis.
+# 2 months approx = 5,184,000 seconds
+db.sales.create_index("created_at", expireAfterSeconds=5184000)
+
+
+if __name__ == "__main__":
+    main()
